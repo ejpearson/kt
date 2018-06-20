@@ -18,15 +18,17 @@ import (
 )
 
 type consumeCmd struct {
-	topic       string
-	brokers     []string
-	offsets     map[int32]interval
-	timeout     time.Duration
-	verbose     bool
-	version     sarama.KafkaVersion
-	encodeValue string
-	encodeKey   string
-	pretty      bool
+	topic         string
+	brokers       []string
+	offsets       map[int32]interval
+	timeout       time.Duration
+	verbose       bool
+	version       sarama.KafkaVersion
+	encodeValue   string
+	encodeKey     string
+	pretty        bool
+	group         string
+	offsetManager sarama.OffsetManager
 
 	client   sarama.Client
 	consumer sarama.Consumer
@@ -77,6 +79,7 @@ type consumeArgs struct {
 	version     string
 	encodeValue string
 	encodeKey   string
+	group       string
 	pretty      bool
 }
 
@@ -199,6 +202,7 @@ func (cmd *consumeCmd) parseArgs(as []string) {
 		args.topic = envTopic
 	}
 	cmd.topic = args.topic
+	cmd.group = args.group
 	cmd.timeout = args.timeout
 	cmd.verbose = args.verbose
 	cmd.pretty = args.pretty
@@ -249,6 +253,7 @@ func (cmd *consumeCmd) parseFlags(as []string) consumeArgs {
 	flags.StringVar(&args.version, "version", "", "Kafka protocol version")
 	flags.StringVar(&args.encodeValue, "encodevalue", "string", "Present message value as (string|hex|base64), defaults to string.")
 	flags.StringVar(&args.encodeKey, "encodekey", "string", "Present message key as (string|hex|base64), defaults to string.")
+	flags.StringVar(&args.group, "group", "string", "Commit consumed offsets using the given group.")
 
 	flags.Usage = func() {
 		fmt.Fprintln(os.Stderr, "Usage of consume:")
@@ -281,6 +286,13 @@ func (cmd *consumeCmd) setupClient() {
 	}
 }
 
+func (cmd *consumeCmd) setupOffsetManager() {
+	var err error
+	if cmd.offsetManager, err = sarama.NewOffsetManagerFromClient(cmd.group, cmd.client); err != nil {
+		failf("failed to create offset manager err=%v", err)
+	}
+}
+
 func (cmd *consumeCmd) run(args []string) {
 	var err error
 
@@ -291,6 +303,9 @@ func (cmd *consumeCmd) run(args []string) {
 	}
 
 	cmd.setupClient()
+	if cmd.group != "" {
+		cmd.setupOffsetManager()
+	}
 
 	if cmd.consumer, err = sarama.NewConsumerFromClient(cmd.client); err != nil {
 		failf("failed to create consumer err=%v", err)
@@ -396,9 +411,18 @@ func encodeBytes(data []byte, encoding string) *string {
 func (cmd *consumeCmd) partitionLoop(out chan printContext, pc sarama.PartitionConsumer, p int32, end int64) {
 	defer logClose(fmt.Sprintf("partition consumer %v", p), pc)
 	var (
+		err     error
+		pom     sarama.PartitionOffsetManager
 		timer   *time.Timer
 		timeout = make(<-chan time.Time)
 	)
+
+	if cmd.group != "" {
+		if pom, err = cmd.offsetManager.ManagePartition(cmd.topic, p); err != nil {
+			fmt.Fprintf(os.Stderr, "failed to create partition offset manager err=%s", err)
+			return
+		}
+	}
 
 	for {
 		if cmd.timeout > 0 {
@@ -426,6 +450,10 @@ func (cmd *consumeCmd) partitionLoop(out chan printContext, pc sarama.PartitionC
 			ctx := printContext{output: m, done: make(chan struct{})}
 			out <- ctx
 			<-ctx.done
+
+			if cmd.group != "" {
+				pom.MarkOffset(msg.Offset+1, "")
+			}
 
 			if end > 0 && msg.Offset >= end {
 				return

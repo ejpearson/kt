@@ -49,6 +49,13 @@ func build(t *testing.T) {
 	require.Zero(t, status)
 }
 
+func testRequestData() map[string]interface{} {
+	return map[string]interface{}{"value": fmt.Sprintf("hello, %s", randomString(6)),
+		"key":       randomString(6),
+		"partition": float64(0),
+	}
+}
+
 func TestSystem(t *testing.T) {
 	build(t)
 
@@ -60,11 +67,7 @@ func TestSystem(t *testing.T) {
 	// kt produce
 	//
 
-	req := map[string]interface{}{
-		"value":     fmt.Sprintf("hello, %s", randomString(6)),
-		"key":       "boom",
-		"partition": float64(0),
-	}
+	req := testRequestData()
 	buf, err := json.Marshal(req)
 	require.NoError(t, err)
 	status, stdOut, stdErr = newCmd().stdIn(string(buf)).run("./kt", "produce", "-topic", "kt-test")
@@ -83,6 +86,7 @@ func TestSystem(t *testing.T) {
 	//
 	// kt consume
 	//
+	var lastConsumed map[string]interface{}
 
 	status, stdOut, stdErr = newCmd().run("./kt", "consume", "-topic", "kt-test", "-timeout", "500ms")
 	require.Zero(t, status)
@@ -90,12 +94,82 @@ func TestSystem(t *testing.T) {
 	lines := strings.Split(stdOut, "\n")
 	require.True(t, len(lines) > 1)
 
-	var lastConsumed map[string]interface{}
 	err = json.Unmarshal([]byte(lines[len(lines)-2]), &lastConsumed)
 	require.NoError(t, err)
 	require.Equal(t, req["value"], lastConsumed["value"])
 	require.Equal(t, req["key"], lastConsumed["key"])
 	require.Equal(t, req["partition"], lastConsumed["partition"])
+
+	// test resume / group
+	reqs := []map[string]interface{}{testRequestData(), testRequestData()}
+	var mReqs string
+
+	buf, err = json.Marshal(reqs[0])
+	require.NoError(t, err)
+	mReqs = string(buf)
+
+	buf, err = json.Marshal(reqs[1])
+	require.NoError(t, err)
+	mReqs += fmt.Sprintf("\n%s", buf)
+
+	status, stdOut, stdErr = newCmd().stdIn(mReqs).run("./kt", "produce", "-topic", "kt-test")
+	fmt.Printf(">> system test kt produce stdout:\n%s\n", stdOut)
+	fmt.Printf(">> system test kt produce stderr:\n%s\n", stdErr)
+	require.Zero(t, status)
+	require.Empty(t, stdErr)
+
+	testGroup := randomString(8)
+	status, stdOut, stdErr = newCmd().run("./kt", "consume", "-topic", "kt-test", "-timeout", "500ms", "-group", testGroup)
+	require.Zero(t, status)
+
+	lines = strings.Split(stdOut, "\n")
+	require.True(t, len(lines) > 1)
+
+	fmt.Printf(">>\n")
+	fmt.Printf("len(%d)\n", len(lines))
+	fmt.Printf("%s\n", lines[len(lines)-2])
+	fmt.Printf("%s\n", lines[len(lines)-1])
+	fmt.Printf(">>\n")
+	// err = json.Unmarshal([]byte(lines[len(lines)-2]), &lastConsumed)
+	// require.NoError(t, err)
+	// require.Equal(t, reqs[1]["value"], lastConsumed["value"]) // only reads newest / default behavior
+	// require.Equal(t, reqs[1]["key"], lastConsumed["key"])
+	// require.Equal(t, reqs[1]["partition"], lastConsumed["partition"])
+
+	// should read both this time around
+
+	reqs = []map[string]interface{}{testRequestData(), testRequestData()}
+
+	buf, err = json.Marshal(reqs[0])
+	require.NoError(t, err)
+	mReqs = string(buf)
+
+	buf, err = json.Marshal(reqs[1])
+	require.NoError(t, err)
+	mReqs += fmt.Sprintf("\n%s", buf)
+
+	status, stdOut, stdErr = newCmd().stdIn(mReqs).run("./kt", "produce", "-topic", "kt-test")
+	fmt.Printf(">> system test kt produce stdout:\n%s\n", stdOut)
+	fmt.Printf(">> system test kt produce stderr:\n%s\n", stdErr)
+	require.Zero(t, status)
+	require.Empty(t, stdErr)
+
+	status, stdOut, stdErr = newCmd().run("./kt", "consume", "-topic", "kt-test", "-timeout", "500ms", "-group", testGroup)
+	require.Zero(t, status)
+
+	lines = strings.Split(stdOut, "\n")
+	require.True(t, len(lines) > 1)
+
+	fmt.Printf(">>\n")
+	fmt.Printf("len(%d)\n", len(lines))
+	fmt.Printf("%s\n", lines[len(lines)-2])
+	fmt.Printf("%s\n", lines[len(lines)-1])
+	fmt.Printf(">>\n")
+	// err = json.Unmarshal([]byte(lines[len(lines)-2]), &lastConsumed)
+	// require.NoError(t, err)
+	// require.Equal(t, reqs[1]["value"], lastConsumed["value"]) // only reads newest / default behavior
+	// require.Equal(t, reqs[1]["key"], lastConsumed["key"])
+	// require.Equal(t, reqs[1]["partition"], lastConsumed["partition"])
 
 	//
 	// kt group
