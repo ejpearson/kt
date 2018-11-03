@@ -18,6 +18,8 @@ import (
 )
 
 type consumeCmd struct {
+	sync.Mutex
+
 	topic       string
 	brokers     []string
 	tlsCA       string
@@ -35,7 +37,10 @@ type consumeCmd struct {
 	client        sarama.Client
 	consumer      sarama.Consumer
 	offsetManager sarama.OffsetManager
+	poms          map[int32]sarama.PartitionOffsetManager
 }
+
+var offsetResume int64 = -3
 
 type offset struct {
 	relative bool
@@ -63,6 +68,13 @@ func (cmd *consumeCmd) resolveOffset(o offset, partition int32) (int64, error) {
 		}
 
 		return res + o.diff, nil
+	} else if o.start == offsetResume {
+		if cmd.group == "" {
+			return 0, fmt.Errorf("cannot resume without -group argument")
+		}
+		pom := cmd.getPOM(partition)
+		next, _ := pom.NextOffset()
+		return next, nil
 	}
 
 	return o.start + o.diff, nil
@@ -91,7 +103,7 @@ type consumeArgs struct {
 
 func parseOffset(str string) (offset, error) {
 	result := offset{}
-	re := regexp.MustCompile("(oldest|newest)?(-|\\+)?(\\d+)?")
+	re := regexp.MustCompile("(oldest|newest|resume)?(-|\\+)?(\\d+)?")
 	matches := re.FindAllStringSubmatch(str, -1)
 
 	if len(matches) == 0 || len(matches[0]) < 4 {
@@ -124,6 +136,9 @@ func parseOffset(str string) (offset, error) {
 	case "oldest":
 		result.relative = true
 		result.start = sarama.OffsetOldest
+	case "resume":
+		result.relative = true
+		result.start = offsetResume
 	}
 
 	return result, nil
@@ -252,7 +267,7 @@ func (cmd *consumeCmd) parseArgs(as []string) {
 
 func (cmd *consumeCmd) parseFlags(as []string) consumeArgs {
 	var args consumeArgs
-	flags := flag.NewFlagSet("consume", flag.ExitOnError)
+	flags := flag.NewFlagSet("consume", flag.ContinueOnError)
 	flags.StringVar(&args.topic, "topic", "", "Topic to consume (required).")
 	flags.StringVar(&args.brokers, "brokers", "", "Comma separated list of brokers. Port defaults to 9092 when omitted (defaults to localhost:9092).")
 	flags.StringVar(&args.tlsCA, "tlsca", "", "Path to the TLS certificate authority file")
@@ -265,16 +280,21 @@ func (cmd *consumeCmd) parseFlags(as []string) consumeArgs {
 	flags.StringVar(&args.version, "version", "", "Kafka protocol version")
 	flags.StringVar(&args.encodeValue, "encodevalue", "string", "Present message value as (string|hex|base64), defaults to string.")
 	flags.StringVar(&args.encodeKey, "encodekey", "string", "Present message key as (string|hex|base64), defaults to string.")
-	flags.StringVar(&args.group, "group", "", "Consumer group to use for marking offsets.")
+	flags.StringVar(&args.group, "group", "", "Consumer group to use for marking offsets. kt will mark offsets if this arg is supplied.")
 
 	flags.Usage = func() {
 		fmt.Fprintln(os.Stderr, "Usage of consume:")
 		flags.PrintDefaults()
 		fmt.Fprintln(os.Stderr, consumeDocString)
+	}
+
+	err := flags.Parse(as)
+	if err != nil && strings.Contains(err.Error(), "flag: help requested") {
+		os.Exit(0)
+	} else if err != nil {
 		os.Exit(2)
 	}
 
-	flags.Parse(as)
 	return args
 }
 
@@ -327,6 +347,7 @@ func (cmd *consumeCmd) run(args []string) {
 	if len(partitions) == 0 {
 		failf("Found no partitions to consume")
 	}
+	defer cmd.closePOMs()
 
 	cmd.consume(partitions)
 }
@@ -430,21 +451,47 @@ func encodeBytes(data []byte, encoding string) *string {
 	return &str
 }
 
+func (cmd *consumeCmd) closePOMs() {
+	cmd.Lock()
+	for p, pom := range cmd.poms {
+		if err := pom.Close(); err != nil {
+			fmt.Fprintf(os.Stderr, "failed to close partition offset manager for partition %v err=%v", p, err)
+		}
+	}
+	cmd.Unlock()
+}
+
+func (cmd *consumeCmd) getPOM(p int32) sarama.PartitionOffsetManager {
+	cmd.Lock()
+	if cmd.poms == nil {
+		cmd.poms = map[int32]sarama.PartitionOffsetManager{}
+	}
+	pom, ok := cmd.poms[p]
+	if ok {
+		cmd.Unlock()
+		return pom
+	}
+
+	pom, err := cmd.offsetManager.ManagePartition(cmd.topic, p)
+	if err != nil {
+		cmd.Unlock()
+		failf("failed to create partition offset manager err=%v", err)
+	}
+	cmd.poms[p] = pom
+	cmd.Unlock()
+	return pom
+}
+
 func (cmd *consumeCmd) partitionLoop(out chan printContext, pc sarama.PartitionConsumer, p int32, end int64) {
 	defer logClose(fmt.Sprintf("partition consumer %v", p), pc)
 	var (
 		timer   *time.Timer
 		pom     sarama.PartitionOffsetManager
-		err     error
 		timeout = make(<-chan time.Time)
 	)
 
 	if cmd.group != "" {
-		pom, err = cmd.offsetManager.ManagePartition(cmd.topic, p)
-		if err != nil {
-			failf("failed to create partition offset manager err=%v", err)
-		}
-		defer pom.Close()
+		pom = cmd.getPOM(p)
 	}
 
 	for {
@@ -527,10 +574,12 @@ The default is to consume from the oldest offset on every partition for the give
 
 The following syntax is supported for each offset:
 
-  (oldest|newest)?(+|-)?(\d+)?
+  (oldest|newest|resume)?(+|-)?(\d+)?
 
  - "oldest" and "newest" refer to the oldest and newest offsets known for a
    given partition.
+
+ - "resume" can be used in combination with -group.
 
  - You can use "+" with a numeric value to skip the given number of messages
    since the oldest offset. For example, "1=+20" will skip 20 offset value since
